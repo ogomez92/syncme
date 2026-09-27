@@ -1,0 +1,29 @@
+# SyncMe for one user, started at boot without needing a login.
+# Enable with: systemctl enable --now syncme@USERNAME
+# Settings and indexes live in /var/lib/syncme/USERNAME, outside anything you sync,
+# so the home folder can be synced as a whole. The web app is on http://127.0.0.1:47474/.
+[Unit]
+Description=SyncMe folder sync for %i
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=%i
+StateDirectory=syncme/%i
+ExecStart=/usr/local/bin/syncme --headless --data-dir ${STATE_DIRECTORY}
+Restart=on-failure
+RestartSec=5
+# tracing writes plain text to the journal instead of ANSI colours
+Environment=NO_COLOR=1
+# SyncMe has to read and write wherever the user's synced folders are, so the
+# home directory and the rest of the filesystem stay writable for that user.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

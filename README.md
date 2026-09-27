@@ -39,6 +39,16 @@ Requires Rust (stable). Prism is linked statically from `prism-sdk-v0.18.2/` nex
 
 - **Windows:** `cargo build --release` → `target\release\syncme.exe`. It is a single file with no DLLs or redistributables needed (the static CRT is configured in `.cargo/config.toml`).
 - **macOS:** `sh scripts/build-mac.sh` → `dist/syncme` (universal) and `dist/SyncMe.app` (menu-bar only).
+- **Linux:** `sh scripts/build-linux.sh` → `dist/syncme`, headless (no tray, so no GTK needed). Screen reader announcements aren't available on Linux yet.
+
+### Running on Linux with systemd
+
+`sudo sh scripts/install-linux.sh USERNAME` copies the program to `/usr/local/bin/syncme`, installs `packaging/linux/syncme@.service`, and runs `systemctl enable --now syncme@USERNAME`. SyncMe then starts at boot as that user, with its settings and indexes in `/var/lib/syncme/USERNAME`. They are kept out of the home folder so you can sync the home folder itself.
+
+- Status and logs: `systemctl status syncme@USERNAME`, `journalctl -u syncme@USERNAME -f`
+- Stop or disable: `sudo systemctl disable --now syncme@USERNAME`
+- Pairing from the terminal: `syncme requests` lists pairing requests, `syncme accept lenovo` or `syncme decline lenovo` answers one (the name can be left out when only one is waiting). `syncme devices` lists paired and nearby devices, and `syncme pair NAME` (or an address) sends a request. These commands talk to the SyncMe already running on the machine; use `--port` if it isn't on 47474.
+- The web app only answers on the machine itself. From another computer, use an SSH tunnel: `ssh -L 47474:127.0.0.1:47474 server`, then open `http://127.0.0.1:47474/`.
 
 Portable mode: create a folder named `syncme-data` next to the program, and settings are kept there instead of in your user config folder. Other options are listed by `syncme --help`: `--data-dir`, `--port`, `--name`, `--background`, `--headless`.
 

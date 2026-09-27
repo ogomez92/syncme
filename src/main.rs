@@ -3,6 +3,7 @@
 
 mod announce;
 mod autostart;
+mod cli;
 mod clipboard;
 mod discovery;
 mod index;
@@ -28,11 +29,12 @@ struct Args {
     name: Option<String>,
     background: bool,
     headless: bool,
+    command: Vec<String>,
 }
 
 const HELP: &str = "SyncMe - keeps folders in sync between your computers.
 
-Usage: syncme [options]
+Usage: syncme [options] [command]
   --data-dir <dir>   where settings and indexes are kept
                      (default: a 'syncme-data' folder next to the program if it exists,
                      otherwise your user config folder)
@@ -40,10 +42,12 @@ Usage: syncme [options]
   --name <name>      name shown to other devices (default: computer name)
   --background       don't open the web app on start
   --headless         no tray icon; run until stopped (for servers and tests)
+
+Without a command, SyncMe starts.
 ";
 
 fn parse_args() -> Args {
-    let mut a = Args { data_dir: None, port: None, name: None, background: false, headless: false };
+    let mut a = Args { data_dir: None, port: None, name: None, background: false, headless: false, command: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -57,10 +61,11 @@ fn parse_args() -> Args {
             "--background" => a.background = true,
             "--headless" => a.headless = true,
             "-h" | "--help" => {
-                println!("{HELP}");
+                println!("{HELP}\n{}", cli::HELP);
                 std::process::exit(0);
             }
-            other => eprintln!("ignoring unknown argument {other}"),
+            other if other.starts_with('-') => eprintln!("ignoring unknown argument {other}"),
+            _ => a.command.push(arg),
         }
     }
     a
@@ -102,6 +107,14 @@ fn init_logging(data_dir: &std::path::Path) {
 fn main() {
     let args = parse_args();
     let data_dir = args.data_dir.clone().unwrap_or_else(default_data_dir);
+    if !args.command.is_empty() {
+        if let Err(e) = cli::run(&args.command, &data_dir, args.port) {
+            eprintln!("{e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         eprintln!("cannot create {}: {e}", data_dir.display());
         std::process::exit(1);
