@@ -38,7 +38,8 @@ pub struct ReplicaRt {
     dirty: AtomicBool,
     pull_all: AtomicBool,
     pull_from: Mutex<HashSet<ReplicaId>>,
-    last_event: Mutex<Instant>,
+    /// Last file system event; None until the first one.
+    last_event: Mutex<Option<Instant>>,
     kick: Notify,
     pub status: Mutex<RtStatus>,
     cancel: CancellationToken,
@@ -157,7 +158,7 @@ pub fn reconcile(app: &AppRef) {
             dirty: AtomicBool::new(true),
             pull_all: AtomicBool::new(true),
             pull_from: Mutex::new(HashSet::new()),
-            last_event: Mutex::new(Instant::now() - Duration::from_secs(10)),
+            last_event: Mutex::new(None),
             kick: Notify::new(),
             status: Mutex::new(RtStatus { state: "idle".into(), ..Default::default() }),
             cancel: CancellationToken::new(),
@@ -183,7 +184,7 @@ pub async fn reset_replica(app: &AppRef, id: &str) -> Result<()> {
 
 async fn worker(app: AppRef, rt: Arc<ReplicaRt>) {
     let mut last_full = Instant::now();
-    let mut last_purge = Instant::now() - Duration::from_secs(86400);
+    let mut last_purge: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = rt.kick.notified() => {}
@@ -193,7 +194,7 @@ async fn worker(app: AppRef, rt: Arc<ReplicaRt>) {
         // Let bursts of file system events settle.
         let started = Instant::now();
         loop {
-            let quiet = rt.last_event.lock().elapsed();
+            let quiet = rt.last_event.lock().map_or(Duration::MAX, |t| t.elapsed());
             if quiet >= Duration::from_millis(400) || started.elapsed() > Duration::from_secs(3) {
                 break;
             }
@@ -210,8 +211,8 @@ async fn worker(app: AppRef, rt: Arc<ReplicaRt>) {
         if let Err(e) = cycle(&app, &rt).await {
             tracing::warn!("{}: {e:#}", rt.root.display());
         }
-        if last_purge.elapsed() > Duration::from_secs(6 * 3600) {
-            last_purge = Instant::now();
+        if last_purge.is_none_or(|t| t.elapsed() > Duration::from_secs(6 * 3600)) {
+            last_purge = Some(Instant::now());
             let days = app.cfg.read().settings.trash_days;
             let root = rt.root.clone();
             tokio::task::spawn_blocking(move || index::purge_trash(&root, days));
@@ -314,7 +315,7 @@ fn ensure_watcher(rt: &Arc<ReplicaRt>) {
         };
         if relevant {
             rt.dirty.store(true, Ordering::SeqCst);
-            *rt.last_event.lock() = Instant::now();
+            *rt.last_event.lock() = Some(Instant::now());
             rt.kick.notify_one();
         }
     };
