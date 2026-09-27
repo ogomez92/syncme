@@ -1,0 +1,5 @@
+/target
+/dist
+# Prism SDK is large; unpack it next to Cargo.toml (see README)
+/prism-*/
+__pycache__/

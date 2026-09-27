@@ -1,0 +1,4 @@
+# Prism's static library is built against the static MSVC CRT (/MT).
+# Linking the CRT statically also means the .exe needs no VC++ redistributable.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

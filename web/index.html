@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>SyncMe</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link visually-hidden" href="#main">Skip to content</a>
+  <header class="top">
+    <div class="wrap">
+      <h1>SyncMe</h1>
+      <p id="me-line">Connecting…</p>
+      <p id="status-line" class="status-line"></p>
+      <nav aria-label="Sections">
+        <ul>
+          <li><a href="#folders">Synced folders</a></li>
+          <li><a href="#devices">Devices</a></li>
+          <li><a href="#activity">Activity</a></li>
+          <li><a href="#settings">Settings</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1" class="wrap">
+    <p id="conn-error" class="banner error" role="alert" hidden></p>
+
+    <section id="folders" aria-labelledby="folders-h">
+      <div class="section-head">
+        <h2 id="folders-h">Synced folders</h2>
+        <button type="button" id="add-folder" class="primary">Add folder…</button>
+      </div>
+      <p id="no-shares" class="muted" hidden>No folders are synced yet. Use “Add folder…” to choose a folder on this computer and where it should go on your other devices or drives.</p>
+      <ul id="share-list" class="cards" role="list"></ul>
+    </section>
+
+    <section id="transfers-section" aria-labelledby="transfers-h" hidden>
+      <h2 id="transfers-h">Transfers in progress</h2>
+      <ul id="transfer-list" role="list"></ul>
+    </section>
+
+    <section id="devices" aria-labelledby="devices-h">
+      <h2 id="devices-h">Devices</h2>
+
+      <div id="incoming-block" hidden>
+        <h3>Pairing requests</h3>
+        <ul id="incoming-list" class="rows" role="list"></ul>
+      </div>
+
+      <h3>Paired devices</h3>
+      <p id="no-devices" class="muted" hidden>No paired devices yet. Start SyncMe on your other computer; it will appear under “Found nearby” when it is on the same network or on your Tailscale network.</p>
+      <ul id="device-list" class="rows" role="list"></ul>
+
+      <h3>Found nearby</h3>
+      <p id="no-discovered" class="muted">Searching the local network and Tailscale…</p>
+      <ul id="discovered-list" class="rows" role="list"></ul>
+
+      <form id="add-peer-form" class="inline-form" novalidate>
+        <div class="field">
+          <label for="peer-addr">Add a device by address</label>
+          <p id="peer-addr-hint" class="hint">An IP address or name, such as 192.168.1.20 or my-mac on Tailscale. Port 47474 is used unless you add one.</p>
+          <input id="peer-addr" name="address" type="text" autocomplete="off" spellcheck="false" aria-describedby="peer-addr-hint peer-addr-error">
+          <p id="peer-addr-error" class="error-text" hidden></p>
+        </div>
+        <button type="submit">Find device</button>
+      </form>
+    </section>
+
+    <section id="activity" aria-labelledby="activity-h">
+      <h2 id="activity-h">Activity</h2>
+      <p id="no-activity" class="muted">Nothing has happened yet.</p>
+      <ol id="activity-list" class="activity" reversed></ol>
+    </section>
+
+    <section id="settings" aria-labelledby="settings-h">
+      <h2 id="settings-h">Settings</h2>
+      <form id="name-form" class="inline-form" novalidate>
+        <div class="field">
+          <label for="device-name">Name of this computer</label>
+          <p id="device-name-hint" class="hint">Shown to your other devices.</p>
+          <input id="device-name" type="text" maxlength="60" required aria-describedby="device-name-hint">
+        </div>
+        <button type="submit">Save name</button>
+      </form>
+      <form id="settings-form" novalidate>
+        <fieldset>
+          <legend>Announcements</legend>
+          <div class="check">
+            <input type="checkbox" id="set-announce" name="announce">
+            <label for="set-announce">Announce sync activity with my screen reader when this page is not in focus</label>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="set-announce-visible" name="announce_when_visible">
+            <label for="set-announce-visible">Also announce through the screen reader while this page is focused</label>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="set-tts" name="allow_tts">
+            <label for="set-tts">Use the system voice when no screen reader is running</label>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Startup</legend>
+          <div class="check">
+            <input type="checkbox" id="set-login" name="start_at_login">
+            <label for="set-login">Start SyncMe when I sign in</label>
+          </div>
+          <div class="check">
+            <input type="checkbox" id="set-browser" name="open_browser_on_start">
+            <label for="set-browser">Open this page when SyncMe starts</label>
+          </div>
+        </fieldset>
+        <div class="field">
+          <label for="set-trash">Keep files removed by other devices for this many days</label>
+          <p id="set-trash-hint" class="hint">They are kept in the hidden .syncme/trash folder inside each synced folder.</p>
+          <input id="set-trash" name="trash_days" type="number" min="1" max="3650" inputmode="numeric" aria-describedby="set-trash-hint">
+        </div>
+        <button type="submit">Save settings</button>
+      </form>
+    </section>
+  </main>
+
+  <footer class="wrap muted small">
+    <p>SyncMe keeps your folders in sync. Files are only ever removed when you delete them on one of your devices, and even then a copy is kept in the trash folder.</p>
+  </footer>
+
+  <div id="live" class="visually-hidden" role="status" aria-live="polite"></div>
+
+  <dialog id="folder-dialog" aria-labelledby="folder-dialog-title">
+    <form id="folder-form" method="dialog" novalidate>
+      <h2 id="folder-dialog-title">Add folder</h2>
+      <p id="folder-error" class="banner error" role="alert" hidden></p>
+      <div class="field">
+        <label for="folder-name">Folder name</label>
+        <p id="folder-name-hint" class="hint">Only used to recognize it, for example “Music” or “Work documents”.</p>
+        <input id="folder-name" type="text" required aria-describedby="folder-name-hint">
+      </div>
+      <p class="hint">Choose where the folder lives on each device. Check a device to sync to it. A device can have more than one location, for example a second drive.</p>
+      <div id="device-fieldsets"></div>
+      <div class="actions">
+        <button type="submit" class="primary" value="save">Save</button>
+        <button type="button" id="folder-cancel">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="browse-dialog" aria-labelledby="browse-title">
+    <div class="browse">
+      <h2 id="browse-title">Choose a folder</h2>
+      <form id="browse-go" class="inline-form" novalidate>
+        <div class="field">
+          <label for="browse-path">Folder path</label>
+          <input id="browse-path" type="text" spellcheck="false" autocomplete="off">
+        </div>
+        <button type="submit">Open</button>
+      </form>
+      <p id="browse-status" role="status" class="muted"></p>
+      <div class="browse-nav">
+        <button type="button" id="browse-up">Up one level</button>
+        <button type="button" id="browse-home">Home folder</button>
+      </div>
+      <h3 id="browse-roots-h">Drives and locations</h3>
+      <ul id="browse-roots" class="chips" role="list" aria-labelledby="browse-roots-h"></ul>
+      <h3 id="browse-list-h">Folders inside</h3>
+      <ul id="browse-list" class="browse-list" role="list" aria-labelledby="browse-list-h"></ul>
+      <div class="actions">
+        <button type="button" id="browse-choose" class="primary">Use this folder</button>
+        <button type="button" id="browse-cancel">Cancel</button>
+      </div>
+    </div>
+  </dialog>
+</body>
+</html>
