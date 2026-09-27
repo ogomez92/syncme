@@ -3,6 +3,7 @@
 
 mod announce;
 mod autostart;
+mod clipboard;
 mod discovery;
 mod index;
 mod model;
@@ -14,13 +15,9 @@ mod tray;
 mod web;
 
 use anyhow::{Context, Result};
-use parking_lot::{Mutex, RwLock};
 use state::App;
-use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 /// `--data-dir` as given on the command line, reused for "start at login".
 pub static DATA_DIR_ARG: OnceLock<String> = OnceLock::new();
@@ -146,6 +143,13 @@ fn main() {
     #[cfg(feature = "tray")]
     {
         let _keep_lock = lock_file;
+        // Ctrl+C in a console must still remove the tray icon.
+        let app2 = app.clone();
+        rt.spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                app2.shutdown.cancel();
+            }
+        });
         tray::run(app, rt);
     }
 }
@@ -168,31 +172,9 @@ async fn start(args: &Args, data_dir: PathBuf) -> Result<state::AppRef> {
     let port = listener.local_addr()?.port();
     std::fs::write(data_dir.join("port"), port.to_string())?;
 
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(4))
-        .read_timeout(Duration::from_secs(60))
-        .no_proxy()
-        .build()?;
-    let (ui_tx, _) = tokio::sync::broadcast::channel(256);
-    let app = Arc::new(App {
-        data_dir,
-        port,
-        cfg: RwLock::new(cfg),
-        discovered: Mutex::new(HashMap::new()),
-        online: Mutex::new(HashMap::new()),
-        incoming: Mutex::new(HashMap::new()),
-        outgoing: Mutex::new(HashMap::new()),
-        http,
-        ui_tx,
-        activity: Mutex::new(VecDeque::new()),
-        ui_visible: AtomicUsize::new(0),
-        announcer: announce::Announcer::start(),
-        transfers: Mutex::new(HashMap::new()),
-        next_transfer: AtomicUsize::new(1),
-        tray: Mutex::new(None),
-        engine: sync::Engine::default(),
-        shutdown: tokio_util::sync::CancellationToken::new(),
-    });
+    let clipboard = clipboard::Service::start(cfg.settings.sync_clipboard, || Box::new(clipboard::SystemClipboard::default()));
+    let app = App::new(data_dir, port, cfg, clipboard)?;
+    tokio::spawn(clipboard::run(app.clone()));
     app.save();
     tracing::info!("SyncMe {} as \"{}\" ({}) on port {port}, data in {}", env!("CARGO_PKG_VERSION"), app.my_name(), app.me(), app.data_dir.display());
 

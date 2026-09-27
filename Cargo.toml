@@ -10,12 +10,15 @@ tray = ["dep:tray-icon", "dep:tao"]
 
 [dependencies]
 anyhow = "1.0.104"
+arboard = "3.6.1"
 axum = { version = "0.8.9", features = ["ws"] }
+base64 = "0.22.1"
 blake3 = "1.8.7"
 dirs = "7.0.0"
 filetime = "0.2.29"
 futures-util = "0.3.34"
 hostname = "0.4.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
 mdns-sd = "0.21.4"
 notify = "8.2.0"
 open = "5.4.4"
@@ -32,3 +35,9 @@ tracing-subscriber = "0.3.23"
 tray-icon = { version = "0.25.1", optional = true }
 uuid = { version = "1.26.1", features = ["v4"] }
 walkdir = "2.5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_System_DataExchange"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }

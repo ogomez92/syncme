@@ -113,6 +113,14 @@
             <label for="set-browser">Open this page when SyncMe starts</label>
           </div>
         </fieldset>
+        <fieldset>
+          <legend>Clipboard</legend>
+          <div class="check">
+            <input type="checkbox" id="set-clipboard" name="sync_clipboard" aria-describedby="set-clipboard-hint">
+            <label for="set-clipboard">Sync the clipboard on this computer with my other devices</label>
+          </div>
+          <p id="set-clipboard-hint" class="hint">Text and images you copy here are sent to every connected device that also has this on, and what they copy arrives here. Files are never sent. Anything you copy, including passwords, travels over your local network, so turn this on only on devices you trust.</p>
+        </fieldset>
         <div class="field">
           <label for="set-trash">Keep files removed by other devices for this many days</label>
           <p id="set-trash-hint" class="hint">They are kept in the hidden .syncme/trash folder inside each synced folder.</p>

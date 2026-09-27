@@ -11,6 +11,7 @@ enum UserEvent {
     Status(TrayStatus),
     Menu(MenuEvent),
     Tray(TrayIconEvent),
+    Quit,
 }
 
 /// Two circular arrows; blue while transferring, green when idle.
@@ -45,17 +46,42 @@ fn make_icon(busy: bool) -> Icon {
     Icon::from_rgba(px, N, N).expect("icon")
 }
 
+/// The icon is registered with the tooltip "SyncMe" and only the status is
+/// changed afterwards. Windows 11 reads a tray button to screen readers as
+/// the tooltip it was created with followed by the current one, so anything
+/// else in the first tooltip would be repeated forever ("SyncMe: Checking
+/// folders SyncMe: Up to date..."). The latest event is in the menu instead.
+const APP_NAME: &str = "SyncMe";
+
 fn tooltip(st: &TrayStatus) -> String {
-    let mut t = format!("SyncMe: {}", st.status);
-    if !st.last.is_empty() {
-        t.push_str(". ");
-        t.push_str(&st.last);
-    }
+    let mut t = st.status.clone();
     // Windows limits tray tooltips to 127 characters.
     if t.chars().count() > 127 {
         t = t.chars().take(124).collect::<String>() + "...";
     }
     t
+}
+
+/// "just now", "5 min ago", "3 h ago", "2 days ago".
+fn ago(event_ms: u64) -> String {
+    let now = crate::index::now_ms();
+    let secs = now.saturating_sub(event_ms) / 1000;
+    match secs {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{} min ago", secs / 60),
+        3600..=86_399 => format!("{} h ago", secs / 3600),
+        _ => {
+            let d = secs / 86_400;
+            format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+        }
+    }
+}
+
+fn last_text(st: &TrayStatus) -> String {
+    if st.last.is_empty() {
+        return "No activity yet".into();
+    }
+    menu_text(&format!("{}: {}", ago(st.last_ms), st.last), 100)
 }
 
 fn menu_text(s: &str, max: usize) -> String {
@@ -88,6 +114,14 @@ pub fn run(app: AppRef, rt: tokio::runtime::Runtime) -> ! {
         TrayIconEvent::set_event_handler(Some(move |e| {
             let _ = p.send_event(UserEvent::Tray(e));
         }));
+        // Quitting from anywhere else (Ctrl+C, a future web button) must
+        // also remove the icon, or Windows keeps showing a dead one.
+        let p = proxy.clone();
+        let shutdown = app.shutdown.clone();
+        rt.spawn(async move {
+            shutdown.cancelled().await;
+            let _ = p.send_event(UserEvent::Quit);
+        });
     }
 
     let status_item = MenuItem::new("SyncMe: starting", true, None);
@@ -113,20 +147,23 @@ pub fn run(app: AppRef, rt: tokio::runtime::Runtime) -> ! {
                 let st = app.tray_status();
                 let built = TrayIconBuilder::new()
                     .with_menu(Box::new(menu_slot.take().unwrap()))
-                    .with_tooltip(tooltip(&st))
+                    .with_tooltip(APP_NAME)
                     .with_icon(idle_icon.clone())
                     .with_icon_as_template(true)
                     .with_menu_on_left_click(true)
                     .build();
                 match built {
-                    Ok(t) => tray = Some(t),
+                    Ok(t) => {
+                        let _ = t.set_tooltip(Some(tooltip(&st)));
+                        tray = Some(t);
+                    }
                     Err(e) => tracing::error!("tray icon: {e}"),
                 }
                 app.update_tray();
             }
             Event::UserEvent(UserEvent::Status(st)) => {
                 status_item.set_text(menu_text(&st.status, 70));
-                last_item.set_text(if st.last.is_empty() { "No activity yet".into() } else { menu_text(&format!("Last: {}", st.last), 90) });
+                last_item.set_text(last_text(&st));
                 announce_item.set_checked(app.cfg.read().settings.announce);
                 if let Some(t) = &tray {
                     let _ = t.set_tooltip(Some(tooltip(&st)));
@@ -154,6 +191,11 @@ pub fn run(app: AppRef, rt: tokio::runtime::Runtime) -> ! {
                     tray.take();
                     *control_flow = ControlFlow::Exit;
                 }
+            }
+            Event::UserEvent(UserEvent::Quit) => {
+                app.save();
+                tray.take();
+                *control_flow = ControlFlow::Exit;
             }
             Event::UserEvent(UserEvent::Tray(TrayIconEvent::DoubleClick { .. })) => {
                 let _ = open::that_detached(app.ui_url());

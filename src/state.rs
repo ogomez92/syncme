@@ -23,11 +23,14 @@ pub struct Settings {
     pub open_browser_on_start: bool,
     pub start_at_login: bool,
     pub trash_days: u64,
+    /// Share the clipboard (text and images, never files) with connected
+    /// devices that also have this on.
+    pub sync_clipboard: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { announce: true, announce_when_visible: false, allow_tts: false, open_browser_on_start: true, start_at_login: false, trash_days: 30 }
+        Settings { announce: true, announce_when_visible: false, allow_tts: false, open_browser_on_start: true, start_at_login: false, trash_days: 30, sync_clipboard: false }
     }
 }
 
@@ -105,7 +108,9 @@ pub struct Transfer {
 pub struct TrayStatus {
     pub busy: bool,
     pub status: String,
+    /// Most recent event and when it happened (ms since the epoch; 0 if none).
     pub last: String,
+    pub last_ms: u64,
 }
 
 pub type TraySink = Box<dyn Fn(TrayStatus) + Send + Sync>;
@@ -130,11 +135,48 @@ pub struct App {
     pub tray: Mutex<Option<TraySink>>,
     pub engine: crate::sync::Engine,
     pub shutdown: tokio_util::sync::CancellationToken,
+    /// Set by `changed()`; drained by `ui_pump`, which coalesces bursts.
+    pub ui_kick: tokio::sync::Notify,
+    pub clipboard: crate::clipboard::Service,
 }
 
 pub type AppRef = Arc<App>;
 
 impl App {
+    /// Builds the shared state and starts its UI pump. Call inside a tokio runtime.
+    pub fn new(data_dir: PathBuf, port: u16, cfg: Persisted, clipboard: crate::clipboard::Service) -> anyhow::Result<AppRef> {
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(4))
+            .read_timeout(std::time::Duration::from_secs(60))
+            .no_proxy()
+            .build()?;
+        let (ui_tx, _) = broadcast::channel(256);
+        clipboard.set_enabled(cfg.settings.sync_clipboard);
+        let app = Arc::new(App {
+            data_dir,
+            port,
+            cfg: RwLock::new(cfg),
+            discovered: Mutex::new(HashMap::new()),
+            online: Mutex::new(HashMap::new()),
+            incoming: Mutex::new(HashMap::new()),
+            outgoing: Mutex::new(HashMap::new()),
+            http,
+            ui_tx,
+            activity: Mutex::new(VecDeque::new()),
+            ui_visible: AtomicUsize::new(0),
+            announcer: Announcer::start(),
+            transfers: Mutex::new(HashMap::new()),
+            next_transfer: AtomicUsize::new(1),
+            tray: Mutex::new(None),
+            engine: crate::sync::Engine::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+            ui_kick: tokio::sync::Notify::new(),
+            clipboard,
+        });
+        tokio::spawn(App::ui_pump(app.clone()));
+        Ok(app)
+    }
+
     pub fn me(&self) -> NodeId {
         self.cfg.read().node_id.clone()
     }
@@ -177,14 +219,14 @@ impl App {
         }
     }
 
+    /// Marks the state as changed. The web app and tray are refreshed by
+    /// `ui_pump` shortly after, so a burst of small transfers costs one update.
     pub fn changed(&self) {
-        let _ = self.ui_tx.send(UiEvent::State);
-        self.update_tray();
+        self.ui_kick.notify_one();
     }
 
-    /// Records an event, shows it in the web app, and speaks it through the
-    /// screen reader when nobody is looking at the web app.
-    pub fn event(&self, level: &str, text: impl Into<String>) {
+    /// Records an event and shows it in the web app, without speaking it.
+    pub fn note(&self, level: &str, text: impl Into<String>) -> String {
         let text = text.into();
         tracing::info!("[{level}] {text}");
         {
@@ -193,13 +235,20 @@ impl App {
             a.truncate(200);
         }
         let _ = self.ui_tx.send(UiEvent::Event { text: text.clone(), level: level.into() });
+        self.changed();
+        text
+    }
+
+    /// Records an event, shows it in the web app, and speaks it through the
+    /// screen reader when nobody is looking at the web app.
+    pub fn event(&self, level: &str, text: impl Into<String>) {
+        let text = self.note(level, text);
         let s = self.cfg.read().settings.clone();
         let visible = self.ui_visible.load(Ordering::SeqCst) > 0;
         let muted = std::env::var_os("SYNCME_MUTE").is_some();
         if s.announce && !muted && (!visible || s.announce_when_visible) {
             self.announcer.say(format!("SyncMe: {text}"), s.allow_tts);
         }
-        self.changed();
     }
 
     pub fn transfer_start(&self, t: Transfer) -> u64 {
@@ -238,8 +287,21 @@ impl App {
         } else {
             format!("Up to date, {online} device{} connected", if online == 1 { "" } else { "s" })
         };
-        let last = self.activity.lock().front().map(|a| a.text.clone()).unwrap_or_default();
-        TrayStatus { busy: !transfers.is_empty(), status, last }
+        let (last, last_ms) = self.activity.lock().front().map(|a| (a.text.clone(), a.time_ms)).unwrap_or_default();
+        TrayStatus { busy: !transfers.is_empty(), status, last, last_ms }
+    }
+
+    /// Pushes state changes to the web app and tray at most every 100 ms.
+    pub async fn ui_pump(app: AppRef) {
+        loop {
+            tokio::select! {
+                _ = app.ui_kick.notified() => {}
+                _ = app.shutdown.cancelled() => return,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = app.ui_tx.send(UiEvent::State);
+            app.update_tray();
+        }
     }
 
     pub fn update_tray(&self) {

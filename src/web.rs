@@ -396,8 +396,13 @@ async fn save_settings(State(app): State<AppRef>, Json(s): Json<Settings>) -> Ap
     if login_changed {
         crate::autostart::set(s.start_at_login).map_err(|e| bad(format!("Could not change start at login: {e:#}")))?;
     }
-    app.cfg.write().settings = s;
+    let clipboard_changed = app.cfg.read().settings.sync_clipboard != s.sync_clipboard;
+    app.clipboard.set_enabled(s.sync_clipboard);
+    app.cfg.write().settings = s.clone();
     app.save();
+    if clipboard_changed {
+        app.note("info", if s.sync_clipboard { "Clipboard sync is on. Text and images you copy go to your connected devices that also have it on." } else { "Clipboard sync is off." });
+    }
     app.changed();
     Ok(Json(json!({})))
 }

@@ -293,7 +293,8 @@ pub fn hash_file(path: &Path) -> std::io::Result<String> {
     Ok(h.finalize().to_hex().to_string())
 }
 
-fn to_rel(root: &Path, p: &Path) -> Option<String> {
+/// Relative, `/`-separated path of `p` inside `root`; None for the root itself.
+pub fn to_rel(root: &Path, p: &Path) -> Option<String> {
     let rel = p.strip_prefix(root).ok()?;
     let mut parts = Vec::new();
     for c in rel.components() {
@@ -347,93 +348,181 @@ pub struct ScanChange {
     pub deleted: bool,
 }
 
-/// Walks the replica folder and records local changes. Blocking; run on a blocking thread.
-pub fn scan(root: &Path, me: &str, idx: &mut Index) -> Result<Vec<ScanChange>> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut unreadable: Vec<String> = Vec::new();
-    let mut changes = Vec::new();
+/// What a scan did to the index.
+#[derive(Default)]
+pub struct ScanReport {
+    /// New local versions recorded (additions, edits, deletions).
+    pub changes: Vec<ScanChange>,
+    /// Entries whose cached on-disk stat was refreshed without a content change.
+    pub refreshed: usize,
+}
 
-    let walker = walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
-        e.depth() == 0 || !e.file_name().to_str().map(is_ignored_name).unwrap_or(true)
-    });
-    for item in walker {
-        let item = match item {
-            Ok(i) => i,
-            Err(err) => {
-                if let Some(p) = err.path().and_then(|p| to_rel(root, p)) {
-                    unreadable.push(p);
-                } else if err.path() == Some(root) {
-                    anyhow::bail!("cannot read {}: {err}", root.display());
-                }
-                continue;
-            }
-        };
-        if item.depth() == 0 {
+impl ScanReport {
+    pub fn touched(&self) -> bool {
+        !self.changes.is_empty() || self.refreshed > 0
+    }
+}
+
+/// Walks the whole replica folder and records local changes. Blocking; run on a blocking thread.
+pub fn scan(root: &Path, me: &str, idx: &mut Index) -> Result<ScanReport> {
+    let mut w = Walk::new(root, me, idx);
+    w.walk(root, true)?;
+    w.finish(None);
+    Ok(w.report)
+}
+
+/// Re-indexes only the given relative paths (files, or directories with everything
+/// below them), as reported by the file system watcher. For those paths this does
+/// exactly what the full scan would: additions, edits and deletions, including a
+/// whole subtree that vanished. Everything else in the index is left untouched, so
+/// an event the watcher missed is caught by the next full scan, never invented here.
+pub fn scan_paths(root: &Path, me: &str, idx: &mut Index, rels: &[String]) -> Result<ScanReport> {
+    let mut w = Walk::new(root, me, idx);
+    for rel in rels {
+        if rel.split('/').any(is_ignored_name) {
             continue;
         }
-        let Some(rel) = to_rel(root, item.path()) else { continue };
+        let Some(abs) = safe_join(root, rel) else { continue };
+        w.walk(&abs, false)?;
+        // A subtree that is gone must not be mistaken for a deletion when the
+        // whole folder went away (drive unplugged) while we were scanning.
+        if !root.join(META_DIR).is_dir() {
+            anyhow::bail!("{} disappeared while scanning", root.display());
+        }
+        w.finish(Some(rel));
+    }
+    Ok(w.report)
+}
+
+/// Drops paths whose ancestor directory is also in the list, since scanning the
+/// directory covers them.
+pub fn collapse_paths(rels: impl IntoIterator<Item = String>) -> Vec<String> {
+    let set: std::collections::BTreeSet<String> = rels.into_iter().collect();
+    set.iter().filter(|r| !r.rmatch_indices('/').any(|(i, _)| set.contains(&r[..i]))).cloned().collect()
+}
+
+struct Walk<'a> {
+    root: &'a Path,
+    me: &'a str,
+    idx: &'a mut Index,
+    seen: HashSet<String>,
+    unreadable: HashSet<String>,
+    report: ScanReport,
+}
+
+impl<'a> Walk<'a> {
+    fn new(root: &'a Path, me: &'a str, idx: &'a mut Index) -> Self {
+        Walk { root, me, idx, seen: HashSet::new(), unreadable: HashSet::new(), report: ScanReport::default() }
+    }
+
+    /// Walks `start`: the replica root, or one file/directory below it.
+    fn walk(&mut self, start: &Path, is_root: bool) -> Result<()> {
+        let walker = walkdir::WalkDir::new(start).follow_links(false).into_iter().filter_entry(|e| {
+            e.depth() == 0 || !e.file_name().to_str().map(is_ignored_name).unwrap_or(true)
+        });
+        for item in walker {
+            let item = match item {
+                Ok(i) => i,
+                Err(err) => {
+                    if err.path() == Some(start) {
+                        if is_root {
+                            anyhow::bail!("cannot read {}: {err}", start.display());
+                        }
+                        if err.io_error().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+                            // The target itself is gone; finish() records the deletion.
+                            continue;
+                        }
+                    }
+                    if let Some(p) = err.path().and_then(|p| to_rel(self.root, p)) {
+                        self.unreadable.insert(p);
+                    }
+                    continue;
+                }
+            };
+            if is_root && item.depth() == 0 {
+                continue;
+            }
+            self.visit(&item);
+        }
+        Ok(())
+    }
+
+    fn visit(&mut self, item: &walkdir::DirEntry) {
+        let Some(rel) = to_rel(self.root, item.path()) else { return };
         let ft = item.file_type();
         if ft.is_symlink() {
-            continue;
+            return;
         }
-        seen.insert(rel.clone());
-        let prev = idx.entries.get(&rel).cloned();
+        self.seen.insert(rel.clone());
         if ft.is_dir() {
-            if prev.as_ref().is_some_and(|p| p.dir && !p.deleted) {
-                continue;
+            let prev = self.idx.entries.get(&rel);
+            if prev.is_some_and(|p| p.dir && !p.deleted) {
+                return;
             }
+            let prev_vv = prev.map(|p| p.vv.clone());
             let e = Entry { path: rel.clone(), dir: true, deleted: false, size: 0, mtime: 0, hash: String::new(), vv: Vv::new(), seq: 0, by: String::new(), local: None };
-            idx.bump(me, e, prev.as_ref().map(|p| &p.vv));
-            changes.push(ScanChange { path: rel, deleted: false });
-            continue;
+            self.idx.bump(self.me, e, prev_vv.as_ref());
+            self.report.changes.push(ScanChange { path: rel, deleted: false });
+            return;
         }
+        // On Windows walkdir already has this from the directory listing: no extra stat.
         let meta = match item.metadata() {
             Ok(m) => m,
             Err(_) => {
-                unreadable.push(rel);
-                continue;
+                self.unreadable.insert(rel);
+                return;
             }
         };
         let stat = (meta.len(), mtime_ns(&meta));
-        if let Some(p) = &prev {
-            if !p.deleted && !p.dir && p.local == Some(stat) {
-                continue;
-            }
+        if self.idx.entries.get(&rel).is_some_and(|p| !p.deleted && !p.dir && p.local == Some(stat)) {
+            return;
         }
         let hash = match hash_file(item.path()) {
             Ok(h) => h,
             Err(_) => {
                 // Locked or unreadable right now: keep whatever we had, try again later.
-                unreadable.push(rel);
-                continue;
+                self.unreadable.insert(rel);
+                return;
             }
         };
-        if let Some(p) = idx.entries.get_mut(&rel) {
+        if let Some(p) = self.idx.entries.get_mut(&rel) {
             if !p.deleted && !p.dir && p.hash == hash {
                 p.local = Some(stat);
-                continue;
+                self.report.refreshed += 1;
+                return;
             }
         }
+        let prev_vv = self.idx.entries.get(&rel).map(|p| p.vv.clone());
         let e = Entry { path: rel.clone(), dir: false, deleted: false, size: stat.0, mtime: stat.1, hash, vv: Vv::new(), seq: 0, by: String::new(), local: Some(stat) };
-        idx.bump(me, e, prev.as_ref().map(|p| &p.vv));
-        changes.push(ScanChange { path: rel, deleted: false });
+        self.idx.bump(self.me, e, prev_vv.as_ref());
+        self.report.changes.push(ScanChange { path: rel, deleted: false });
     }
 
-    let gone: Vec<Entry> = idx
-        .entries
-        .values()
-        .filter(|e| !e.deleted && !seen.contains(&e.path))
-        .filter(|e| !unreadable.iter().any(|u| e.path == *u || e.path.starts_with(&format!("{u}/"))))
-        .cloned()
-        .collect();
-    for mut e in gone {
-        let vv = e.vv.clone();
-        e.deleted = true;
-        e.local = None;
-        idx.bump(me, e.clone(), Some(&vv));
-        changes.push(ScanChange { path: e.path, deleted: true });
+    /// Records as deleted every live entry under `prefix` (or anywhere) that the
+    /// walk did not see, except at or below paths we could not read.
+    fn finish(&mut self, prefix: Option<&str>) {
+        let pre_dir = prefix.map(|p| format!("{p}/"));
+        let under = |path: &str| match (prefix, &pre_dir) {
+            (Some(p), Some(d)) => path == p || path.starts_with(d.as_str()),
+            _ => true,
+        };
+        let unreadable_dirs: Vec<String> = self.unreadable.iter().map(|u| format!("{u}/")).collect();
+        let gone: Vec<Entry> = self
+            .idx
+            .entries
+            .values()
+            .filter(|e| !e.deleted && under(&e.path) && !self.seen.contains(&e.path))
+            .filter(|e| !self.unreadable.contains(&e.path) && !unreadable_dirs.iter().any(|d| e.path.starts_with(d.as_str())))
+            .cloned()
+            .collect();
+        for mut e in gone {
+            let vv = e.vv.clone();
+            e.deleted = true;
+            e.local = None;
+            self.idx.bump(self.me, e.clone(), Some(&vv));
+            self.report.changes.push(ScanChange { path: e.path, deleted: true });
+        }
     }
-    Ok(changes)
 }
 
 /// Re-indexes one path right before we overwrite or delete it, so an edit the
@@ -635,5 +724,109 @@ mod tests {
     fn stamp_format() {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(20723), (2026, 9, 27));
+    }
+
+    #[test]
+    fn collapse_keeps_only_outermost_paths() {
+        let got = collapse_paths(["a/b/c".to_string(), "a".into(), "a-x".into(), "b/c".into(), "b/c".into()]);
+        assert_eq!(got, vec!["a".to_string(), "a-x".into(), "b/c".into()]);
+    }
+
+    /// Fresh folder with a `.syncme` marker; removed when dropped.
+    struct TempRoot(PathBuf);
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("syncme-test-{tag}-{}-{}", std::process::id(), now_ms()));
+            std::fs::create_dir_all(p.join(META_DIR)).unwrap();
+            TempRoot(p)
+        }
+        fn write(&self, rel: &str, data: &str) {
+            let abs = self.0.join(rel);
+            std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+            std::fs::write(abs, data).unwrap();
+        }
+    }
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn live(idx: &Index) -> Vec<&str> {
+        idx.entries.values().filter(|e| !e.deleted).map(|e| e.path.as_str()).collect()
+    }
+
+    fn rels(v: &[String]) -> Vec<String> {
+        v.to_vec()
+    }
+
+    #[test]
+    fn targeted_scan_matches_full_scan_for_the_given_paths() {
+        let t = TempRoot::new("targeted");
+        t.write("a/x.txt", "x");
+        t.write("a/y.txt", "y");
+        t.write("b.txt", "b");
+        let mut idx = Index::new();
+        let r = scan(&t.0, "me", &mut idx).unwrap();
+        assert_eq!(r.changes.len(), 4);
+        assert_eq!(live(&idx), vec!["a", "a/x.txt", "a/y.txt", "b.txt"]);
+
+        // Nothing changed: no work.
+        let r = scan_paths(&t.0, "me", &mut idx, &rels(&["a/x.txt".into()])).unwrap();
+        assert!(!r.touched());
+
+        // Edit inside a subtree, reported by file path.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        t.write("a/x.txt", "x-edited");
+        let before = idx.entries["a/x.txt"].vv.clone();
+        let r = scan_paths(&t.0, "me", &mut idx, &rels(&["a/x.txt".into()])).unwrap();
+        assert_eq!(r.changes.len(), 1);
+        assert_eq!(cmp_vv(&idx.entries["a/x.txt"].vv, &before), VvOrd::Greater);
+        assert_eq!(idx.entries["a/x.txt"].size, 8);
+
+        // New file only reported through its (already indexed) parent directory.
+        t.write("a/z.txt", "z");
+        let r = scan_paths(&t.0, "me", &mut idx, &rels(&["a".into()])).unwrap();
+        assert_eq!(r.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), vec!["a/z.txt"]);
+
+        // A path that never existed and is not indexed is a no-op, not a tombstone.
+        let r = scan_paths(&t.0, "me", &mut idx, &rels(&["nope.txt".into()])).unwrap();
+        assert!(!r.touched());
+        assert!(!idx.entries.contains_key("nope.txt"));
+
+        // Whole directory removed: everything below it is deleted, the rest untouched.
+        std::fs::remove_dir_all(t.0.join("a")).unwrap();
+        let r = scan_paths(&t.0, "me", &mut idx, &rels(&["a".into()])).unwrap();
+        let mut gone: Vec<&str> = r.changes.iter().filter(|c| c.deleted).map(|c| c.path.as_str()).collect();
+        gone.sort();
+        assert_eq!(gone, vec!["a", "a/x.txt", "a/y.txt", "a/z.txt"]);
+        assert_eq!(live(&idx), vec!["b.txt"]);
+
+        // A touched-but-identical file only refreshes its cached stat.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let now = filetime::FileTime::now();
+        filetime::set_file_mtime(t.0.join("b.txt"), now).unwrap();
+        let r = scan_paths(&t.0, "me", &mut idx, &rels(&["b.txt".into()])).unwrap();
+        assert!(r.changes.is_empty());
+        assert_eq!(r.refreshed, 1);
+        assert_eq!(idx.entries["b.txt"].local, Some((1, mtime_ns(&std::fs::metadata(t.0.join("b.txt")).unwrap()))));
+
+        // Ignored names are never indexed even when reported.
+        t.write("~$lock.docx", "junk");
+        let r = scan_paths(&t.0, "me", &mut idx, &rels(&["~$lock.docx".into()])).unwrap();
+        assert!(!r.touched());
+    }
+
+    #[test]
+    fn targeted_scan_refuses_when_folder_vanished() {
+        let t = TempRoot::new("vanish");
+        t.write("a/x.txt", "x");
+        let mut idx = Index::new();
+        scan(&t.0, "me", &mut idx).unwrap();
+        // Unplugged drive: the marker is gone together with everything else.
+        std::fs::remove_dir_all(&t.0).unwrap();
+        let snapshot = idx.clone();
+        assert!(scan_paths(&t.0, "me", &mut idx, &rels(&["a".into()])).is_err());
+        assert_eq!(live(&idx), live(&snapshot));
     }
 }

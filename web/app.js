@@ -280,6 +280,7 @@ function fillSettings() {
   $('set-tts').checked = s.allow_tts;
   $('set-login').checked = s.start_at_login;
   $('set-browser').checked = s.open_browser_on_start;
+  $('set-clipboard').checked = !!s.sync_clipboard;
   $('set-trash').value = s.trash_days;
   settingsFilled = true;
 }
@@ -300,6 +301,7 @@ $('settings-form').addEventListener('submit', async (e) => {
     allow_tts: $('set-tts').checked,
     start_at_login: $('set-login').checked,
     open_browser_on_start: $('set-browser').checked,
+    sync_clipboard: $('set-clipboard').checked,
     trash_days: days,
   };
   try {

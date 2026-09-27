@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow, bail};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{ConnectInfo, Path as AxPath, Query, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Path as AxPath, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -284,6 +284,7 @@ pub fn routes() -> Router<AppRef> {
         .route("/peer/index/{replica}", get(index_h))
         .route("/peer/file/{replica}", get(file_h))
         .route("/peer/browse", get(browse_h))
+        .route("/peer/clipboard", post(clipboard_h).layer(DefaultBodyLimit::max(crate::clipboard::MAX_BODY_BYTES)))
 }
 
 type HResult<T> = std::result::Result<T, (StatusCode, String)>;
@@ -466,6 +467,25 @@ async fn browse_h(State(app): State<AppRef>, ConnectInfo(remote): ConnectInfo<So
     Ok(Json(browse_local(&q.path)))
 }
 
+/// Clipboard contents from a paired device. Only honoured while clipboard
+/// sync is on here, so a device never gets a clipboard it did not ask for.
+async fn clipboard_h(State(app): State<AppRef>, ConnectInfo(remote): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(wire): Json<crate::clipboard::Wire>) -> HResult<Json<serde_json::Value>> {
+    let node = auth(&app, &headers, remote)?;
+    if !app.clipboard.enabled() {
+        return Err(err(StatusCode::FORBIDDEN, "clipboard sync is off on this device"));
+    }
+    // Decoding an image is CPU work; keep it off the async threads.
+    let content = tokio::task::spawn_blocking(move || crate::clipboard::from_wire(&wire))
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    let what = content.describe();
+    if app.clipboard.accept_remote(content) {
+        app.note("info", format!("Clipboard from {}: {what}", app.node_name(&node)));
+    }
+    Ok(Json(serde_json::json!({})))
+}
+
 pub fn roots() -> Vec<BrowseDir> {
     let mut out = Vec::new();
     if cfg!(windows) {
@@ -510,4 +530,116 @@ pub fn browse_local(path: &str) -> BrowseResult {
         Err(e) => res.error = Some(format!("Cannot open {target}: {e}")),
     }
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clipboard::{Content, MemClipboard, Service};
+    use crate::state::{App, Persisted, Settings};
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    /// A SyncMe instance on an ephemeral port with an in-memory clipboard.
+    async fn node(name: &str, clipboard_on: bool) -> (AppRef, MemClipboard) {
+        let mem = MemClipboard::default();
+        let dir = std::env::temp_dir().join(format!("syncme-test-{}", uuid::Uuid::new_v4()));
+        let settings = Settings { sync_clipboard: clipboard_on, announce: false, ..Settings::default() };
+        let cfg = Persisted { node_id: uuid::Uuid::new_v4().to_string(), name: name.into(), peers: BTreeMap::new(), shares: BTreeMap::new(), settings, manual_addrs: vec![] };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let svc = Service::start(clipboard_on, {
+            let m = mem.clone();
+            move || Box::new(m)
+        });
+        let app = App::new(dir, port, cfg, svc).unwrap();
+        let router = routes().with_state(app.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>()).await.unwrap();
+        });
+        tokio::spawn(crate::clipboard::run(app.clone()));
+        (app, mem)
+    }
+
+    fn pair(a: &AppRef, b: &AppRef) {
+        let token = new_token();
+        let rec = |app: &AppRef| PeerRec { id: app.me(), name: app.my_name(), os: "test".into(), token: token.clone(), addrs: vec![format!("127.0.0.1:{}", app.port)] };
+        a.cfg.write().peers.insert(b.me(), rec(b));
+        b.cfg.write().peers.insert(a.me(), rec(a));
+        a.online.lock().insert(b.me(), format!("127.0.0.1:{}", b.port));
+        b.online.lock().insert(a.me(), format!("127.0.0.1:{}", a.port));
+    }
+
+    async fn wait_for(mut f: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < end {
+            if f() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    fn text(s: &str) -> Content {
+        Content::Text(s.into())
+    }
+
+    #[tokio::test]
+    async fn clipboard_travels_between_devices_and_does_not_bounce() {
+        let (a, ca) = node("A", true).await;
+        let (b, cb) = node("B", true).await;
+        pair(&a, &b);
+        // Let both pollers take their first look.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        ca.set(Some(text("hola desde A: canción 🙂\r\nsegunda línea")));
+        assert!(wait_for(|| cb.get() == Some(text("hola desde A: canción 🙂\r\nsegunda línea"))).await, "B did not get A's text");
+        assert!(wait_for(|| b.activity.lock().iter().any(|x| x.text.starts_with("Clipboard from A: text, "))).await);
+        // B now sees new clipboard content; it must not send it back to A.
+        let writes_on_a = ca.0.lock().1;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(ca.0.lock().1, writes_on_a, "A's clipboard was written again");
+
+        // The other direction, with an image.
+        let img = Content::Image { width: 2, height: 3, rgba: (0..24).collect() };
+        cb.set(Some(img.clone()));
+        assert!(wait_for(|| ca.get() == Some(img.clone())).await, "A did not get B's image");
+        assert!(wait_for(|| a.activity.lock().iter().any(|x| x.text == "Clipboard from B: image, 2 by 3 pixels")).await);
+        let writes_on_b = cb.0.lock().1;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(cb.0.lock().1, writes_on_b, "B's clipboard was written again");
+    }
+
+    #[tokio::test]
+    async fn clipboard_is_refused_where_the_setting_is_off_or_the_token_is_wrong() {
+        let (a, ca) = node("A", true).await;
+        let (b, cb) = node("B", false).await;
+        pair(&a, &b);
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let wire = crate::clipboard::to_wire(&text("secret"), 1).unwrap();
+        let err = post_json::<_, serde_json::Value>(&a, &b.me(), "/peer/clipboard", &wire).await.unwrap_err();
+        assert!(err.to_string().starts_with("403"), "{err}");
+        assert_eq!(cb.get(), None);
+
+        // B copies something: B's setting is off, so nothing leaves B.
+        cb.set(Some(text("stays on B")));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(ca.get(), None);
+
+        // B switches it on but A's token is wrong: unauthorized, nothing written.
+        b.clipboard.set_enabled(true);
+        b.cfg.write().peers.get_mut(&a.me()).unwrap().token = "x".repeat(64);
+        let err = post_json::<_, serde_json::Value>(&a, &b.me(), "/peer/clipboard", &wire).await.unwrap_err();
+        assert!(err.to_string().starts_with("401"), "{err}");
+        assert_eq!(cb.get(), Some(text("stays on B")));
+
+        // Garbage is rejected without touching the clipboard.
+        pair(&a, &b);
+        let bad = serde_json::json!({ "seq": 1, "image": { "width": 2, "height": 2, "png": "bm90IGEgcG5n" } });
+        let err = post_json::<_, serde_json::Value>(&a, &b.me(), "/peer/clipboard", &bad).await.unwrap_err();
+        assert!(err.to_string().starts_with("400"), "{err}");
+        assert_eq!(cb.get(), Some(text("stays on B")));
+    }
 }

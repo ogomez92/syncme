@@ -27,7 +27,11 @@ The settings for a folder are shared with every device involved, so you can edit
 
 Received files, deletions, conflicts, pairing requests, and devices connecting or disconnecting are announced through Prism, which supports NVDA, JAWS, Narrator (UI Automation), VoiceOver, and others. When the web app is focused, it uses its own live region instead, so nothing is read twice. Both behaviors, and a system voice fallback, are in **Settings → Announcements**.
 
-The tray or menu bar icon shows the current state ("Up to date", "Receiving report.docx from NitroPC", …) and the latest event. On Windows, press Win+B to reach the notification area. Its menu opens with Enter or a left click.
+The tray or menu bar icon shows the current state ("Up to date, 1 device connected", "Receiving report.docx from NitroPC", …). On Windows, press Win+B to reach the notification area; screen readers read the icon as "SyncMe" followed by that state. Its menu opens with Enter or a left click and also shows the latest event with how long ago it happened.
+
+## Clipboard sync
+
+**Settings → Clipboard** can share the clipboard between your computers. Text and images you copy on one device are put on the clipboard of every connected device that also has the setting on, in both directions. Files copied in Explorer or Finder are never sent. Text is kept exactly as copied (any language, emoji, line endings), and images travel as PNG. Texts over 4 MB and images over 24 MB or about 8K resolution are skipped. The setting is off by default and is per device: everything you copy, passwords included, is sent to those devices over your local network in the same way as your files.
 
 ## Building
 

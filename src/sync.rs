@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use parking_lot::Mutex;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +17,21 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
+
+/// Files fetched at the same time from one source. Enough to keep a network
+/// link busy across per-file overheads (stat, fsync, rename) without
+/// thrashing a spinning disk on either side.
+const PARALLEL_FILES: usize = 4;
+/// Write buffer per incoming file.
+const WRITE_BUF: usize = 1024 * 1024;
+/// How often every replica of a folder is asked for its changes.
+const PULL_EVERY: Duration = Duration::from_secs(60);
+/// Full re-walk of the folder as a safety net for events the watcher missed.
+const FULL_SCAN_WATCHED: Duration = Duration::from_secs(5 * 60);
+/// Full re-walk when there is no working watcher (the walk is the only way to notice changes).
+const FULL_SCAN_UNWATCHED: Duration = Duration::from_secs(60);
+/// Above this many watcher-reported paths one full walk is cheaper than many small ones.
+const MAX_TARGETED_PATHS: usize = 1000;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct RtStatus {
@@ -35,7 +50,12 @@ pub struct ReplicaRt {
     pub index: Mutex<Index>,
     index_path: PathBuf,
     op: tokio::sync::Mutex<()>,
+    /// A full walk of the folder is due.
     dirty: AtomicBool,
+    /// Paths (relative to `root`) the watcher reported since the last scan.
+    pending: Mutex<BTreeSet<String>>,
+    /// True once the watcher is delivering events for `root`.
+    watching: AtomicBool,
     pull_all: AtomicBool,
     pull_from: Mutex<HashSet<ReplicaId>>,
     /// Last file system event; None until the first one.
@@ -156,6 +176,8 @@ pub fn reconcile(app: &AppRef) {
             index_path,
             op: tokio::sync::Mutex::new(()),
             dirty: AtomicBool::new(true),
+            pending: Mutex::new(BTreeSet::new()),
+            watching: AtomicBool::new(false),
             pull_all: AtomicBool::new(true),
             pull_from: Mutex::new(HashSet::new()),
             last_event: Mutex::new(None),
@@ -184,6 +206,7 @@ pub async fn reset_replica(app: &AppRef, id: &str) -> Result<()> {
 
 async fn worker(app: AppRef, rt: Arc<ReplicaRt>) {
     let mut last_full = Instant::now();
+    let mut last_pull = Instant::now();
     let mut last_purge: Option<Instant> = None;
     loop {
         tokio::select! {
@@ -200,10 +223,14 @@ async fn worker(app: AppRef, rt: Arc<ReplicaRt>) {
             }
             tokio::time::sleep(Duration::from_millis(400) - quiet).await;
         }
-        if last_full.elapsed() >= Duration::from_secs(60) {
+        if last_pull.elapsed() >= PULL_EVERY {
+            last_pull = Instant::now();
+            rt.pull_all.store(true, Ordering::SeqCst);
+        }
+        let full_every = if rt.watching.load(Ordering::Relaxed) { FULL_SCAN_WATCHED } else { FULL_SCAN_UNWATCHED };
+        if last_full.elapsed() >= full_every {
             last_full = Instant::now();
             rt.dirty.store(true, Ordering::SeqCst);
-            rt.pull_all.store(true, Ordering::SeqCst);
         }
         if rt.cancel.is_cancelled() {
             return;
@@ -237,6 +264,7 @@ async fn cycle(app: &AppRef, rt: &Arc<ReplicaRt>) -> Result<()> {
         let was = rt.status.lock().state.clone();
         rt.set_state("missing", Some(msg.clone()));
         rt.watcher.lock().take();
+        rt.watching.store(false, Ordering::Relaxed);
         if was != "missing" {
             app.event("warning", format!("{name}: {msg}"));
         }
@@ -247,28 +275,51 @@ async fn cycle(app: &AppRef, rt: &Arc<ReplicaRt>) -> Result<()> {
     }
     ensure_watcher(rt);
 
-    if rt.dirty.swap(false, Ordering::SeqCst) {
+    // Take both before scanning: anything the watcher reports from now on
+    // belongs to the next cycle, so nothing can fall between two scans.
+    let full = rt.dirty.swap(false, Ordering::SeqCst);
+    let pending = std::mem::take(&mut *rt.pending.lock());
+    if full || !pending.is_empty() {
         rt.set_state("scanning", None);
+        let full = full || pending.len() > MAX_TARGETED_PATHS;
         let rt2 = rt.clone();
         let me = rt.replica.id.clone();
+        let started = Instant::now();
         let res = tokio::task::spawn_blocking(move || {
             let mut idx = rt2.index.lock().clone();
-            let changes = index::scan(&rt2.root, &me, &mut idx)?;
-            if !changes.is_empty() {
+            let report = if full {
+                index::scan(&rt2.root, &me, &mut idx)?
+            } else {
+                index::scan_paths(&rt2.root, &me, &mut idx, &index::collapse_paths(pending))?
+            };
+            if report.touched() {
                 *rt2.index.lock() = idx;
             }
-            anyhow::Ok(changes)
+            anyhow::Ok(report)
         })
         .await?;
         match res {
-            Ok(changes) if !changes.is_empty() => {
-                rt.save_index();
-                let dels = changes.iter().filter(|c| c.deleted).count();
-                tracing::info!("{name}: {} local change(s) ({dels} deletion(s)) in {}, first: {}", changes.len(), rt.root.display(), changes[0].path);
-                notify_others(app, rt);
+            Ok(report) => {
+                if report.touched() {
+                    rt.save_index();
+                }
+                let changes = &report.changes;
+                if !changes.is_empty() {
+                    let dels = changes.iter().filter(|c| c.deleted).count();
+                    let kind = if full { "full scan" } else { "targeted scan" };
+                    tracing::info!(
+                        "{name}: {} local change(s) ({dels} deletion(s)) in {} ({kind}, {:?}), first: {}",
+                        changes.len(),
+                        rt.root.display(),
+                        started.elapsed(),
+                        changes[0].path
+                    );
+                    notify_others(app, rt);
+                }
             }
-            Ok(_) => {}
             Err(e) => {
+                // Whatever we skipped gets picked up by a full walk next time.
+                rt.dirty.store(true, Ordering::SeqCst);
                 rt.set_state("error", Some(format!("{e:#}")));
                 return Err(e);
             }
@@ -306,24 +357,45 @@ fn ensure_watcher(rt: &Arc<ReplicaRt>) {
         return;
     }
     let weak = Arc::downgrade(rt);
-    let meta = rt.root.join(index::META_DIR);
+    let root = rt.root.clone();
+    let meta = root.join(index::META_DIR);
     let handler = move |res: notify::Result<notify::Event>| {
         let Some(rt) = weak.upgrade() else { return };
-        let relevant = match &res {
-            Ok(ev) => ev.paths.is_empty() || ev.paths.iter().any(|p| !p.starts_with(&meta)),
-            Err(_) => true,
-        };
-        if relevant {
-            rt.dirty.store(true, Ordering::SeqCst);
-            *rt.last_event.lock() = Some(Instant::now());
-            rt.kick.notify_one();
+        // Anything we cannot pin to paths inside the folder (an error, an
+        // overflow asking for a rescan, the root itself) means a full walk.
+        let mut full = false;
+        let mut rels = Vec::new();
+        match &res {
+            Err(_) => full = true,
+            Ok(ev) => {
+                if ev.need_rescan() || ev.paths.is_empty() {
+                    full = true;
+                }
+                for p in ev.paths.iter().filter(|p| !p.starts_with(&meta)) {
+                    match index::to_rel(&root, p) {
+                        Some(rel) => rels.push(rel),
+                        None => full = true,
+                    }
+                }
+            }
         }
+        if !full && rels.is_empty() {
+            return; // only our own .syncme bookkeeping
+        }
+        if full {
+            rt.dirty.store(true, Ordering::SeqCst);
+        } else {
+            rt.pending.lock().extend(rels);
+        }
+        *rt.last_event.lock() = Some(Instant::now());
+        rt.kick.notify_one();
     };
     match notify::recommended_watcher(handler) {
         Ok(mut w) => {
             use notify::Watcher;
-            if let Err(e) = w.watch(&rt.root, notify::RecursiveMode::Recursive) {
-                tracing::warn!("watching {}: {e}; relying on periodic scans", rt.root.display());
+            match w.watch(&rt.root, notify::RecursiveMode::Recursive) {
+                Ok(()) => rt.watching.store(true, Ordering::Relaxed),
+                Err(e) => tracing::warn!("watching {}: {e}; relying on periodic scans", rt.root.display()),
             }
             *rt.watcher.lock() = Some(w);
         }
@@ -419,37 +491,71 @@ async fn pull(app: &AppRef, rt: &Arc<ReplicaRt>, src: &Replica) -> Result<()> {
     let label = source_label(app, src);
     let name = share_name(app, &rt.share_id);
     let mut summary = Summary::default();
+    // e.g. a Mac file name with characters Windows doesn't allow: skip it
+    // for good instead of retrying forever. Other copies keep it.
+    entries.retain(|r| {
+        let ok = index::safe_join(&rt.root, &r.path).is_some();
+        if !ok && !r.deleted {
+            summary.skipped.push(r.path.clone());
+        }
+        ok
+    });
+
     let mut failed = 0usize;
     let mut last_err = None;
     let mut changed = false;
-    for r in &entries {
+    let mut tally = |r: &Entry, res: Result<Outcome>| match res {
+        Ok(outcome) => {
+            changed |= outcome.changed;
+            match outcome.kind {
+                Some(Kind::Received) => summary.received.push(r.path.clone()),
+                Some(Kind::Removed) => summary.removed.push(r.path.clone()),
+                Some(Kind::Conflict) => summary.conflicts.push(r.path.clone()),
+                None => {}
+            }
+        }
+        Err(e) => {
+            failed += 1;
+            tracing::warn!("{name}: {}: {e:#}", r.path);
+            last_err = Some(e);
+        }
+    };
+
+    // Directories and deletions depend on order; files are independent of each
+    // other (paths are unique within a delta), so those are fetched in parallel.
+    let files_start = entries.partition_point(|e| !e.deleted && e.dir);
+    let files_end = entries.partition_point(|e| !e.deleted);
+    let (dirs, files, dels) = (&entries[..files_start], &entries[files_start..files_end], &entries[files_end..]);
+    for r in dirs {
         if rt.cancel.is_cancelled() {
             bail!("stopped");
         }
-        if index::safe_join(&rt.root, &r.path).is_none() {
-            // e.g. a Mac file name with characters Windows doesn't allow: skip it
-            // for good instead of retrying forever. Other copies keep it.
-            if !r.deleted {
-                summary.skipped.push(r.path.clone());
+        tally(r, apply(app, rt, src, r, &name, &label).await);
+    }
+    let (name_ref, label_ref) = (name.as_str(), label.as_str());
+    // A loop rather than a closure: rustc cannot prove a closure returning a
+    // future that borrows its argument is Send inside this async fn.
+    let mut fetches = Vec::with_capacity(files.len());
+    for r in files {
+        fetches.push(async move {
+            if rt.cancel.is_cancelled() {
+                return (r, Err(anyhow!("stopped")));
             }
-            continue;
+            (r, apply(app, rt, src, r, name_ref, label_ref).await)
+        });
+    }
+    let mut stream = futures_util::stream::iter(fetches).buffer_unordered(PARALLEL_FILES);
+    while let Some((r, res)) = stream.next().await {
+        tally(r, res);
+    }
+    if rt.cancel.is_cancelled() {
+        bail!("stopped");
+    }
+    for r in dels {
+        if rt.cancel.is_cancelled() {
+            bail!("stopped");
         }
-        match apply(app, rt, src, r, &name, &label).await {
-            Ok(outcome) => {
-                changed |= outcome.changed;
-                match outcome.kind {
-                    Some(Kind::Received) => summary.received.push(r.path.clone()),
-                    Some(Kind::Removed) => summary.removed.push(r.path.clone()),
-                    Some(Kind::Conflict) => summary.conflicts.push(r.path.clone()),
-                    None => {}
-                }
-            }
-            Err(e) => {
-                failed += 1;
-                tracing::warn!("{name}: {}: {e:#}", r.path);
-                last_err = Some(e);
-            }
-        }
+        tally(r, apply(app, rt, src, r, &name, &label).await);
     }
     if failed == 0 {
         rt.index.lock().peer_seq.insert(src.id.clone(), (delta.epoch, delta.seq));
@@ -639,7 +745,9 @@ async fn download(app: &AppRef, rt: &Arc<ReplicaRt>, src: &Replica, r: &Entry, n
 
 async fn download_inner(app: &AppRef, src: &Replica, r: &Entry, tmp: &Path, tid: u64) -> Result<()> {
     let mut hasher = blake3::Hasher::new();
-    let mut out = tokio::fs::File::create(tmp).await?;
+    // Every write on a tokio file is a hop to the blocking pool, and network
+    // chunks are small; buffer so the disk sees large writes.
+    let mut out = tokio::io::BufWriter::with_capacity(WRITE_BUF, tokio::fs::File::create(tmp).await?);
     let mut done = 0u64;
     if src.node == app.me() {
         let other = app.engine.get(&src.id).ok_or_else(|| anyhow!("location not running"))?;
@@ -670,7 +778,9 @@ async fn download_inner(app: &AppRef, src: &Replica, r: &Entry, tmp: &Path, tid:
         }
     }
     out.flush().await?;
-    out.sync_all().await?;
+    // Content must be on disk before the rename: a crash in between would
+    // otherwise leave a truncated file that the next scan spreads as an edit.
+    out.get_ref().sync_all().await?;
     drop(out);
     let got = hasher.finalize().to_hex().to_string();
     if got != r.hash {
